@@ -72,6 +72,52 @@ void ts_generate_random(TimeSeries *ts, unsigned int seed) {
     ts->label = oss.str();
 }
 
+/* Real data loading */
+
+/*
+ * UCR .ts format:
+ *
+ * Strategy: read every data line, strip the label prefix (up to the first
+ * comma if present), parse the floats, and append them all into a single
+ * flat vector.  Finally, truncate to target_length so the output is always
+ * exactly the size the caller requested.
+ */
+bool ts_load_ucr_concat(TimeSeries *ts, const char *filepath, size_t target_length)
+{
+    std::ifstream f(filepath);
+    if (!f.is_open()) {
+        std::fprintf(stderr, "[UCR] Cannot open: %s\n", filepath);
+        return false;
+    }
+
+    ts->data.clear();
+    ts->data.reserve(target_length);
+
+    std::string line;
+    while (std::getline(f, line) && ts->data.size() < target_length) {
+        if (line.empty() || line[0] == '@') continue;   // skip header
+
+        // Strip class label: everything up to and including the first comma
+        size_t comma = line.find(',');
+        std::string values = (comma != std::string::npos) ? line.substr(comma + 1) : line;
+
+        std::istringstream ss(values);
+        float val;
+        while (ss >> val && ts->data.size() < target_length)
+            ts->data.push_back(val);
+    }
+
+    if (ts->data.empty()) {
+        std::fprintf(stderr, "[UCR] No data found in: %s\n", filepath);
+        return false;
+    }
+
+    // Truncate to exactly target_length
+    ts->data.resize(target_length);
+    ts->label = "ucr_forda";
+    return true;
+}
+
 
 /* SAD */
 float sad_window(const float *window, const float *pattern, size_t len) {

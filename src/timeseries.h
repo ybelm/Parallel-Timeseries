@@ -48,6 +48,15 @@ void db_free(TimeSeriesDB *db);
 void ts_generate_sine(TimeSeries *ts, float freq, float noise_level);
 void ts_generate_random(TimeSeries *ts, unsigned int seed);
 
+/* Real data loading */
+
+/*
+ * Load a UCR .ts file (FordA format), concatenate all series into a single
+ * TimeSeries, and truncate to target_length.  Returns false if the file
+ * cannot be opened or contains no data.
+ */
+bool ts_load_ucr_concat(TimeSeries *ts, const char *filepath, size_t target_length);
+
 /* SAD */
 
 float sad_window(const float *window, const float *pattern, size_t len);
