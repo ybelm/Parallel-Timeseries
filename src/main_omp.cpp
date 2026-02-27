@@ -25,39 +25,22 @@ SearchResult search_omp(const TimeSeries *ts, const TimeSeries *pattern,
     float  best_sad = std::numeric_limits<float>::max();
     size_t best_pos = 0;
 
-    // Use a small chunk size for better load balancing
-    omp_set_schedule(sched, 1);
+    omp_set_schedule(sched, chunk_size);
 
     #pragma omp parallel num_threads(n_threads)
     {
         float  local_best_sad = std::numeric_limits<float>::max();
         size_t local_best_pos = 0;
 
-        #pragma omp for schedule(dynamic)
+        #pragma omp for schedule(runtime) nowait
         for (size_t pos = 0; pos < n_windows; pos++) {
-
-            // Recompute pointer for clarity
-            const float *ts_ptr = ts->data.data() + pos;
-
-            float sad = sad_window(ts_ptr, pattern->data.data(), pat_len);
-
-            // Update global result inside loop
-            #pragma omp critical
-            {
-                if (sad < best_sad) {
-                    best_sad = sad;
-                    best_pos = pos;
-                }
-            }
-
-            // Keep local tracking as well
+            float sad = sad_window(&ts->data[pos], pattern->data.data(), pat_len);
             if (sad < local_best_sad) {
                 local_best_sad = sad;
                 local_best_pos = pos;
             }
         }
 
-        // Final check with local best
         #pragma omp critical
         {
             if (local_best_sad < best_sad) {
@@ -76,34 +59,29 @@ SearchResult search_omp(const TimeSeries *ts, const TimeSeries *pattern,
 void search_multi_pattern_omp(const TimeSeries *ts, const TimeSeries *patterns,
                               SearchResult *results, size_t n_patterns, int n_threads)
 {
-    #pragma omp parallel for schedule(static) num_threads(n_threads)
-    for (size_t p = 0; p < n_patterns; p++) {
-        // Use single-threaded search for each pattern
-        results[p] = search_omp(ts, &patterns[p], omp_sched_dynamic, 0, 1);
-    }
+    omp_set_max_active_levels(1);
+
+    #pragma omp parallel for schedule(dynamic) num_threads(n_threads)
+    for (size_t p = 0; p < n_patterns; p++)
+        results[p] = search_omp(ts, &patterns[p], omp_sched_static, 0, 1);
 }
 
 /* DB parallel search */
 SearchResult search_db_omp(const TimeSeriesDB *db, const TimeSeries *pattern, int n_threads)
 {
     SearchResult global;
-    global.best_sad = std::numeric_limits<float>::max();
 
-    #pragma omp parallel for schedule(static) num_threads(n_threads)
+    #pragma omp parallel for schedule(dynamic) num_threads(n_threads)
     for (size_t s = 0; s < db->count(); s++) {
-
         SearchResult local = search_sequential(&db->series[s], pattern);
         local.series_idx = s;
 
-        // Update global result
         #pragma omp critical
         {
-            if (local.best_sad < global.best_sad) {
+            if (local.best_sad < global.best_sad)
                 global = local;
-            }
         }
     }
-
     return global;
 }
 
@@ -163,6 +141,45 @@ static int test_correctness(void) {
     }
     std::printf("Correctness: %s\n", all_pass ? "PASS" : "FAIL");
 
+    /* Multi-pattern correctness */
+    const size_t N_PAT = 4;
+    size_t inject_pos[N_PAT]  = { 100, 500, 1200, 2800 };
+    TimeSeries mp_ts = ts_alloc(ts_len);
+    TimeSeries mp_patterns[N_PAT];
+    SearchResult mp_results [N_PAT];
+
+    ts_generate_random(&mp_ts, 7);
+
+    for (size_t p = 0; p < N_PAT; p++) {
+        mp_patterns[p] = ts_alloc(pat_len);
+        TimeSeries src_p = ts_alloc(pat_len);
+        ts_generate_sine(&src_p, (float)(p + 1) * 1.5f, 0.0f);
+        std::copy(src_p.data.begin(), src_p.data.end(), mp_patterns[p].data.begin());
+        std::copy(src_p.data.begin(), src_p.data.end(), mp_ts.data.begin() + inject_pos[p]);
+        ts_free(&src_p);
+    }
+
+    search_multi_pattern_omp(&mp_ts, mp_patterns, mp_results, N_PAT, 4);
+
+    int mp_pass = 1;
+    for (size_t p = 0; p < N_PAT; p++) {
+        int ok = (mp_results[p].best_pos == inject_pos[p] && mp_results[p].best_sad < 1e-4f);
+        if (!ok) {
+            std::printf("FAIL: multi-pattern p=%zu  pos=%zu (expected %zu)  SAD=%.6f\n",
+                        p, mp_results[p].best_pos, inject_pos[p], mp_results[p].best_sad);
+            mp_pass = 0;
+            all_pass = 0;
+        }
+        ts_free(&mp_patterns[p]);
+    }
+    ts_free(&mp_ts);
+    std::printf("Multi-pattern correctness: %s\n", mp_pass ? "PASS" : "FAIL");
+
+    ts_free(&ts);
+    ts_free(&pattern);
+    ts_free(&src);
+    return all_pass ? 0 : 1;
+}
 
 /* Benchmark: thread scaling */
 
@@ -258,6 +275,52 @@ static void bench_seq_vs_omp(void) {
     }
 }
 
+/* Benchmark: multi-pattern */
+/*
+ * Strategy A - sequential loop over patterns, each search is sequential.
+ * Strategy B - search_multi_pattern_omp, patterns distributed across threads.
+ */
+static void bench_multi_pattern(void) {
+    std::printf("\n--- Multi-pattern search (ts=%d, pat=%d, 8 threads) ---\n",
+                TS_LENGTH, PATTERN_LENGTH);
+
+    size_t n_patterns_list[] = { 1, 2, 4, 8, 16 };
+    int n = (int)(sizeof(n_patterns_list) / sizeof(n_patterns_list[0]));
+
+    TimeSeries ts = ts_alloc(TS_LENGTH);
+    ts_generate_sine(&ts, 3.0f, 0.1f);
+
+    for (int i = 0; i < n; i++) {
+        size_t N = n_patterns_list[i];
+
+        std::vector<TimeSeries> patterns(N);
+        std::vector<SearchResult> results (N);
+        for (size_t p = 0; p < N; p++) {
+            patterns[p] = ts_alloc(PATTERN_LENGTH);
+            ts_generate_sine(&patterns[p], (float)(p + 1) * 0.5f, 0.0f);
+        }
+
+        // Strategy A: sequential
+        double t0 = get_time_seconds();
+        for (int r = 0; r < N_RUNS; r++)
+            for (size_t p = 0; p < N; p++)
+                results[p] = search_sequential(&ts, &patterns[p]);
+        double t_seq = (get_time_seconds() - t0) / N_RUNS;
+
+        // Strategy B: OMP multi-pattern
+        double t1 = get_time_seconds();
+        for (int r = 0; r < N_RUNS; r++)
+            search_multi_pattern_omp(&ts, patterns.data(), results.data(), N, 8);
+        double t_omp = (get_time_seconds() - t1) / N_RUNS;
+
+        std::printf("n_patterns=%2zu  seq=%8.4f s  omp=%8.4f s  speedup=%.2fx\n",
+                    N, t_seq, t_omp, t_omp > 0 ? t_seq / t_omp : 0.0);
+
+        for (size_t p = 0; p < N; p++) ts_free(&patterns[p]);
+    }
+
+    ts_free(&ts);
+}
 
 /* Benchmark: real data (FordA) */
 
