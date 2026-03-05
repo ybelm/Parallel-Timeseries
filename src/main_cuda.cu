@@ -246,6 +246,71 @@ static int test_correctness()
     return all_pass ? 0 : 1;
 }
 
+/* Benchmark: block size */
+static void bench_block_size()
+{
+    std::printf("\n--- Block size scaling (ts=%d, pat=%d) ---n", TS_LENGTH, PATTERN_LENGTH);
+
+    TimeSeries ts = ts_alloc(TS_LENGTH);
+    TimeSeries pattern = ts_alloc(PATTERN_LENGTH);
+    ts_generate_sine(&ts, 3.0f, 0.1f);
+    ts_generate_sine(&pattern, 3.0f, 0.0f);
+
+    BenchStats s_seq = benchmark(search_sequential, &ts, &pattern, N_RUNS);
+    std::printf("sequential -> mean=%.4f ms\n", s_seq.mean * 1e3);
+
+    CudaContext ctx = cuda_context_init(&ts, &pattern);
+
+    int block_sizes[] = { 32, 64, 128, 256, 512 };
+    int n = (int)(sizeof(block_sizes) / sizeof(block_sizes[0]));
+
+    for (int i = 0; i < n; ++i) {
+        CudaParams p = { block_sizes[i], false };
+        auto fn = make_cuda_wrapper(&ctx, &p);
+        BenchStats s  = benchmark(fn, &ts, &pattern, N_RUNS);
+        std::printf("block=%3d  global -> mean=%.4f ms  speedup=%.2fx\n",
+                    block_sizes[i], s.mean * 1e3, s_seq.mean / s.mean);
+    }
+
+    cuda_context_free(&ctx);
+    ts_free(&ts);
+    ts_free(&pattern);
+}
+
+/* Benchmark: global vs shared memory */
+static void bench_shared_vs_global()
+{
+    std::printf("\n--- Global vs Shared memory (block=256) ---n");
+
+    size_t pat_lengths[] = { 500, 1000, 2500, 5000 };
+    int n = (int)(sizeof(pat_lengths) / sizeof(pat_lengths[0]));
+
+    for (int i = 0; i < n; ++i) {
+        TimeSeries ts = ts_alloc(TS_LENGTH);
+        TimeSeries pattern = ts_alloc(pat_lengths[i]);
+        ts_generate_sine(&ts, 3.0f, 0.1f);
+        ts_generate_sine(&pattern, 3.0f, 0.0f);
+
+        CudaContext ctx = cuda_context_init(&ts, &pattern);
+
+        CudaParams p_global = { 256, false };
+        CudaParams p_shared = { 256, true };
+
+        auto fn_global = make_cuda_wrapper(&ctx, &p_global);
+        auto fn_shared = make_cuda_wrapper(&ctx, &p_shared);
+
+        BenchStats s_global = benchmark(fn_global, &ts, &pattern, N_RUNS);
+        BenchStats s_shared = benchmark(fn_shared, &ts, &pattern, N_RUNS);
+
+        std::printf("pat_len=%5zu  global=%.4f ms  shared=%.4f ms  ratio=%.2fx\n",
+                    pat_lengths[i], s_global.mean * 1e3, s_shared.mean * 1e3,
+                    s_global.mean / s_shared.mean);
+
+        cuda_context_free(&ctx);
+        ts_free(&ts);
+        ts_free(&pattern);
+    }
+}
 
 /* Benchmark: CUDA vs Sequential */
 static void bench_cuda_vs_seq()
@@ -320,6 +385,8 @@ int main()
         return 1;
     }
 
+    bench_block_size();
+    bench_shared_vs_global();
     bench_cuda_vs_seq();
     bench_real_data();
 
