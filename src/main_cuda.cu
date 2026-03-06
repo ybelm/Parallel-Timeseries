@@ -374,6 +374,39 @@ static void bench_real_data()
     ts_free(&pattern);
 }
 
+static void print_summary() {
+    std::printf("\n%s\n", std::string(65, '=').c_str());
+    std::printf(" SUMMARY - single series (ts=%d, pat=%d)\n", TS_LENGTH, PATTERN_LENGTH);
+    std::printf("%s\n", std::string(65, '=').c_str());
+    std::printf(" %-20s  %10s  %10s  %10s\n", "Config", "Mean (ms)", "Min (ms)", "Speedup");
+    std::printf(" %s\n", std::string(55, '-').c_str());
+
+    TimeSeries ts = ts_alloc(TS_LENGTH);
+    TimeSeries pattern = ts_alloc(PATTERN_LENGTH);
+    ts_generate_sine(&ts, 3.0f, 0.1f);
+    ts_generate_sine(&pattern, 3.0f, 0.0f);
+
+    BenchStats s_seq = benchmark(search_sequential, &ts, &pattern, N_RUNS);
+    std::printf("  %-20s  %10.2f  %10.2f  %10s\n",
+                "sequential", s_seq.mean * 1e3, s_seq.min * 1e3, "1.00x");
+
+    CudaContext ctx = cuda_context_init(&ts, &pattern);
+    int block_sizes[] = { 32, 64, 128, 256, 512 };
+    for (int bs : block_sizes) {
+        for (bool shared : {false, true}) {
+            CudaParams p = { bs, shared };
+            auto fn = make_cuda_wrapper(&ctx, &p);
+            BenchStats s = benchmark(fn, &ts, &pattern, N_RUNS);
+            char label[32]; std::snprintf(label, sizeof(label), "block=%d %s", bs, shared ? "shared" : "global");
+            char sp[16]; std::snprintf(sp, sizeof(sp), "%.2fx", s_seq.mean / s.mean);
+            std::printf("  %-20s  %10.2f  %10.2f  %10s\n", label, s.mean * 1e3, s.min * 1e3, sp);
+        }
+    }
+    cuda_context_free(&ctx);
+    ts_free(&ts); ts_free(&pattern);
+    std::printf("%s\n", std::string(65, '=').c_str());
+}
+
 /* Main */
 int main()
 {
@@ -391,5 +424,6 @@ int main()
     bench_real_data();
 
     std::printf("\nDone.\n");
+    print_summary();
     return 0;
 }
