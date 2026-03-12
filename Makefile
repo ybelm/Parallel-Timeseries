@@ -38,6 +38,6 @@ run_omp: omp
 
 # Clean
 clean:
-	rm -f sequential omp
+	rm -f sequential omp main_cuda
 
 .PHONY: all sequential omp run_seq run_omp clean
